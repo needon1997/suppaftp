@@ -4,20 +4,13 @@
 
 use std::fmt::Debug;
 
-use async_std::io::{Read, Write};
-use async_std::net::TcpStream;
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
-use crate::FtpResult;
+use crate::types::FtpResult;
 
-#[cfg(feature = "async-native-tls")]
-mod native_tls;
-#[cfg(feature = "async-native-tls")]
-pub use self::native_tls::{AsyncNativeTlsConnector, AsyncNativeTlsStream};
-
-#[cfg(feature = "async-rustls")]
 mod rustls;
-#[cfg(feature = "async-rustls")]
 pub use self::rustls::{AsyncRustlsConnector, AsyncRustlsStream};
 
 #[async_trait]
@@ -27,8 +20,8 @@ pub trait AsyncTlsConnector: Debug {
     async fn connect(&self, domain: &str, stream: TcpStream) -> FtpResult<Self::Stream>;
 }
 
-pub trait AsyncTlsStream: Debug + Read + Write + Unpin {
-    type InnerStream: Read + Write;
+pub trait AsyncTlsStream: Debug + AsyncRead + AsyncWrite + Unpin {
+    type InnerStream: AsyncRead + AsyncWrite;
 
     /// Get underlying tcp stream
     fn tcp_stream(self) -> TcpStream;
@@ -43,17 +36,17 @@ pub trait AsyncTlsStream: Debug + Read + Write + Unpin {
 #[derive(Debug)]
 pub struct AsyncNoTlsStream;
 
-impl Read for AsyncNoTlsStream {
+impl AsyncRead for AsyncNoTlsStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-        _buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+        _buf: &mut ReadBuf,
+    ) -> std::task::Poll<std::io::Result<()>> {
         panic!()
     }
 }
 
-impl Write for AsyncNoTlsStream {
+impl AsyncWrite for AsyncNoTlsStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
@@ -69,7 +62,7 @@ impl Write for AsyncNoTlsStream {
         panic!()
     }
 
-    fn poll_close(
+    fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {

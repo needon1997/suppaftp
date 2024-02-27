@@ -5,33 +5,25 @@
 mod data_stream;
 mod tls;
 
-#[cfg(not(feature = "async-secure"))]
-use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::string::String;
 use std::time::Duration;
 
-use async_std::io::prelude::BufReadExt;
-use async_std::io::{copy, BufReader, Read, Write, WriteExt};
-use async_std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{copy, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 // export
 pub use data_stream::DataStream;
 pub use tls::AsyncNoTlsStream;
-#[cfg(feature = "async-secure")]
 pub use tls::AsyncTlsConnector;
-use tls::AsyncTlsStream;
-#[cfg(feature = "async-native-tls")]
-pub use tls::{AsyncNativeTlsConnector, AsyncNativeTlsStream};
-#[cfg(feature = "async-rustls")]
+pub use tls::AsyncTlsStream;
 pub use tls::{AsyncRustlsConnector, AsyncRustlsStream};
 
 use super::regex::{EPSV_PORT_RE, MDTM_RE, PASV_PORT_RE, SIZE_RE};
 use super::types::{FileType, FtpError, FtpResult, Mode, Response};
 use super::Status;
-use crate::command::Command;
-#[cfg(feature = "async-secure")]
-use crate::command::ProtectionLevel;
+use crate::command::{Command, ProtectionLevel};
 use crate::types::Features;
 
 /// Stream to interface with the FTP server. This interface is only for the command stream.
@@ -44,11 +36,7 @@ where
     nat_workaround: bool,
     welcome_msg: Option<String>,
     active_timeout: Duration,
-    #[cfg(not(feature = "async-secure"))]
-    marker: PhantomData<T>,
-    #[cfg(feature = "async-secure")]
     tls_ctx: Option<Box<dyn AsyncTlsConnector<Stream = T> + Send + Sync + 'static>>,
-    #[cfg(feature = "async-secure")]
     domain: Option<String>,
 }
 
@@ -68,26 +56,23 @@ where
     /// Try to connect to the remote server but with the specified timeout
     pub async fn connect_timeout(addr: SocketAddr, timeout: Duration) -> FtpResult<Self> {
         debug!("Connecting to server {addr}");
-        let stream = async_std::io::timeout(timeout, async move { TcpStream::connect(addr).await })
+        let stream = tokio::time::timeout(timeout, async move { TcpStream::connect(addr).await })
             .await
-            .map_err(FtpError::ConnectionError)?;
+            .map_err(|_| FtpError::ConnectionError(std::io::ErrorKind::TimedOut.into()))?
+            .map_err(|err| FtpError::ConnectionError(err))?;
 
         Self::connect_with_stream(stream).await
     }
 
     /// Connect using provided configured tcp stream
-    async fn connect_with_stream(stream: TcpStream) -> FtpResult<Self> {
+    pub async fn connect_with_stream(stream: TcpStream) -> FtpResult<Self> {
         debug!("Established connection with server");
         let mut ftp_stream = ImplAsyncFtpStream {
             reader: BufReader::new(DataStream::Tcp(stream)),
-            #[cfg(not(feature = "async-secure"))]
-            marker: PhantomData {},
             mode: Mode::Passive,
             nat_workaround: false,
             welcome_msg: None,
-            #[cfg(feature = "async-secure")]
             tls_ctx: None,
-            #[cfg(feature = "async-secure")]
             domain: None,
             active_timeout: Duration::from_secs(60),
         };
@@ -119,8 +104,6 @@ where
     /// let mut ftp_stream = ImplAsyncFtpStream::connect("127.0.0.1:21").await.unwrap();
     /// let mut ftp_stream = ftp_stream.into_secure(ctx, "localhost").await.unwrap();
     /// ```
-    #[cfg(feature = "async-secure")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async-secure")))]
     pub async fn into_secure(
         mut self,
         tls_connector: impl AsyncTlsConnector<Stream = T> + Send + Sync + 'static,
@@ -132,10 +115,7 @@ where
         self.read_response(Status::AuthOk).await?;
         debug!("TLS OK; initializing ssl stream");
         let stream = tls_connector
-            .connect(
-                domain,
-                self.reader.into_inner().into_tcp_stream().to_owned(),
-            )
+            .connect(domain, self.reader.into_inner().into_tcp_stream())
             .await
             .map_err(|e| FtpError::SecureError(format!("{e}")))?;
         let mut secured_ftp_tream = ImplAsyncFtpStream {
@@ -175,11 +155,7 @@ where
     /// let mut ctx = TlsConnector::new();
     /// let mut ftp_stream = ImplAsyncFtpStream::connect_secure_implicit("127.0.0.1:990", ctx, "localhost").await.unwrap();
     /// ```
-    #[cfg(all(feature = "async-secure", feature = "deprecated"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "async-secure", feature = "deprecated")))
-    )]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "deprecated"))))]
     pub async fn connect_secure_implicit<A: ToSocketAddrs>(
         addr: A,
         tls_connector: impl AsyncTlsConnector<Stream = T> + Send + Sync + 'static,
@@ -254,7 +230,7 @@ where
     }
 
     /// Returns a reference to the underlying TcpStream.
-    pub async fn get_ref(&self) -> &TcpStream {
+    pub fn get_ref(&self) -> &TcpStream {
         self.reader.get_ref().get_ref()
     }
 
@@ -279,8 +255,6 @@ where
     /// Perform clear command channel (CCC).
     /// Once the command is performed, the command channel will be encrypted no more.
     /// The data stream will still be secure.
-    #[cfg(feature = "async-secure")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async-secure")))]
     pub async fn clear_command_channel(mut self) -> FtpResult<Self> {
         // Ask the server to stop securing data
         debug!("performing clear command channel");
@@ -387,7 +361,7 @@ where
     /// data stream opened.
     pub async fn retr<S, F, U>(&mut self, file_name: S, mut reader: F) -> FtpResult<U>
     where
-        F: FnMut(&mut dyn Read) -> FtpResult<U>,
+        F: FnMut(&mut dyn AsyncRead) -> FtpResult<U>,
         S: AsRef<str>,
     {
         match self.retr_as_stream(file_name).await {
@@ -419,7 +393,7 @@ where
     }
 
     /// Finalize retr stream; must be called once the requested file, got previously with `retr_as_stream()` has been read
-    pub async fn finalize_retr_stream(&mut self, stream: impl Read) -> FtpResult<()> {
+    pub async fn finalize_retr_stream(&mut self, stream: impl AsyncRead) -> FtpResult<()> {
         debug!("Finalizing retr stream");
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         drop(stream);
@@ -454,7 +428,7 @@ where
     /// r argument must be any struct which implemenents the Read trait
     pub async fn put_file<S, R>(&mut self, filename: S, r: &mut R) -> FtpResult<u64>
     where
-        R: Read + std::marker::Unpin,
+        R: AsyncRead + std::marker::Unpin,
         S: AsRef<str>,
     {
         // Get stream
@@ -486,7 +460,7 @@ where
     /// Finalize put when using stream
     /// This method must be called once the file has been written and
     /// `put_with_stream` has been used to write the file
-    pub async fn finalize_put_stream(&mut self, stream: impl Write) -> FtpResult<()> {
+    pub async fn finalize_put_stream(&mut self, stream: impl AsyncWrite) -> FtpResult<()> {
         debug!("Finalizing put stream");
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         drop(stream);
@@ -515,7 +489,7 @@ where
     /// Append data from reader to file at `filename`
     pub async fn append_file<R>(&mut self, filename: &str, r: &mut R) -> FtpResult<u64>
     where
-        R: Read + std::marker::Unpin,
+        R: AsyncRead + std::marker::Unpin,
     {
         // Get stream
         let mut data_stream = self.append_with_stream(filename).await?;
@@ -529,7 +503,7 @@ where
     /// abort the previous FTP service command
     pub async fn abort<R>(&mut self, data_stream: R) -> FtpResult<()>
     where
-        R: Read + std::marker::Unpin + 'static,
+        R: AsyncRead + std::marker::Unpin + 'static,
     {
         debug!("Aborting active file transfer");
         self.perform(Command::Abor).await?;
@@ -695,7 +669,7 @@ where
                 let listener = self.active().await?;
                 self.perform(cmd).await?;
 
-                match async_std::future::timeout(self.active_timeout, listener.accept()).await {
+                match tokio::time::timeout(self.active_timeout, listener.accept()).await {
                     Ok(Ok((stream, addr))) => {
                         debug!("Connection received from {}", addr);
                         stream
@@ -725,12 +699,6 @@ where
             }
         };
 
-        #[cfg(not(feature = "async-secure"))]
-        {
-            Ok(DataStream::Tcp(stream))
-        }
-
-        #[cfg(feature = "async-secure")]
         match self.tls_ctx {
             Some(ref tls_ctx) => tls_ctx
                 .connect(self.domain.as_ref().unwrap(), stream)
@@ -951,7 +919,7 @@ mod test {
 
     #[cfg(feature = "async-native-tls")]
     use async_native_tls::TlsConnector as NativeTlsConnector;
-    #[cfg(any(feature = "with-containers", feature = "async-secure"))]
+    #[cfg(any(feature = "with-containers"))]
     use pretty_assertions::assert_eq;
     #[cfg(feature = "with-containers")]
     use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -965,7 +933,7 @@ mod test {
     use crate::{AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 
     #[cfg(feature = "with-containers")]
-    #[async_attributes::test]
+    #[tokio::test]
     #[serial]
     async fn connect() {
         crate::log_init();
@@ -974,7 +942,7 @@ mod test {
     }
 
     /*
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "async-native-tls")]
     #[serial]
     async fn should_connect_ssl_native_tls() {
@@ -1001,7 +969,7 @@ mod test {
         assert!(ftp_stream.quit().await.is_ok());
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[serial]
     #[cfg(all(feature = "async-native-tls", feature = "deprecated"))]
     async fn should_connect_ssl_implicit_native_tls() {
@@ -1024,7 +992,7 @@ mod test {
     }
 
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "async-native-tls")]
     #[serial]
     async fn should_work_after_clear_command_channel_native_tls() {
@@ -1049,7 +1017,7 @@ mod test {
         assert!(ftp_stream.quit().await.is_ok());
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "async-rustls")]
     #[serial]
     async fn should_connect_ssl_rustls() {
@@ -1071,7 +1039,7 @@ mod test {
     }
     */
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[serial]
     async fn should_change_mode() {
         crate::log_init();
@@ -1085,7 +1053,7 @@ mod test {
         assert_eq!(ftp_stream.mode, Mode::Passive);
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn should_connect_with_timeout() {
@@ -1101,7 +1069,7 @@ mod test {
         );
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn welcome_message() {
@@ -1114,7 +1082,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn should_set_passive_nat_workaround() {
@@ -1125,7 +1093,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn get_ref() {
@@ -1135,7 +1103,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn change_wrkdir() {
@@ -1148,7 +1116,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn cd_up() {
@@ -1161,7 +1129,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn noop() {
@@ -1171,7 +1139,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn make_and_remove_dir() {
@@ -1191,7 +1159,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn should_get_feat_and_set_opts() {
@@ -1203,7 +1171,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn set_transfer_type() {
@@ -1217,7 +1185,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[cfg(feature = "with-containers")]
     #[serial]
     async fn transfer_file() {
@@ -1270,7 +1238,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[serial]
     #[cfg(feature = "with-containers")]
     async fn should_resume_transfer() {
@@ -1322,7 +1290,7 @@ mod test {
         finalize_stream(stream).await;
     }
 
-    #[async_attributes::test]
+    #[tokio::test]
     #[serial]
     #[cfg(feature = "with-containers")]
     async fn should_transfer_file_with_extended_passive_mode() {

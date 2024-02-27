@@ -1,3 +1,49 @@
-[workspace]
-members = ["suppaftp", "suppaftp-cli"]
-resolver = "2"
+[package]
+name = "suppaftp"
+version = "5.3.1"
+authors = [
+  "Christian Visintin <christian.visintin@veeso.dev>",
+  "Matt McCoy <mattnenterprise@yahoo.com>",
+]
+edition = "2021"
+documentation = "https://docs.rs/suppaftp/"
+repository = "https://github.com/veeso/suppaftp"
+description = "A super FTP/FTPS client library for Rust"
+include = [
+  "src/**/*",
+  "../LICENSE-APACHE",
+  "../LICENSE-MIT",
+  "../README.md",
+  "../CHANGELOG.md",
+]
+readme = "../README.md"
+license = "Apache-2.0"
+keywords = ["ftp", "ftps", "network-protocol", "async"]
+categories = ["asynchronous", "network-programming"]
+
+[lib]
+name = "suppaftp"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "^0.4", default-features = false, features = ["clock"] }
+lazy-regex = "^3"
+log = "^0.4"
+thiserror = "^1"
+tokio = "1"
+async-trait = "0.1"
+pin-project = "^1"
+rustls = "0.22"
+tokio-rustls = { path = "../tokio-rustls" }
+
+[dev-dependencies]
+async-attributes = "1.1.2"
+env_logger = "^0.11"
+pretty_assertions = "^1.0.0"
+rand = "^0.8.4"
+serial_test = "^3.0"
+webpki-roots = "0.26"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
